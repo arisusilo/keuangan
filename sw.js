@@ -1,7 +1,7 @@
 /* Catatan Keuangan — service worker
    Menyimpan tampilan aplikasi di HP supaya tetap bisa dibuka & dipakai mencatat saat offline.
    Data transaksi TIDAK disimpan di sini (disimpan aplikasi di penyimpanan lokal & dikirim saat online). */
-const CACHE = 'ku-shell-v1';
+const CACHE = 'ku-shell-v3';
 const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png'];
 
 self.addEventListener('install', (e) => {

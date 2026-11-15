@@ -6,7 +6,7 @@
 (function () {
   'use strict';
 
-  var VERSION = '1.0.0';
+  var VERSION = '1.2.0';
   var LS = { cfg: 'ku.cfg', cache: 'ku.cache', queue: 'ku.queue', prefs: 'ku.prefs', demo: 'ku.demo', demoDb: 'ku.demodb' };
   var BATCH_SIZE = 15;
   /* Palet kategori (urutan tetap, sudah divalidasi aman buta warna) */
@@ -120,6 +120,142 @@
     });
     return best ? best.cat : '';
   }
+  /* ============================================================
+     INPUT SUARA — mengubah kalimat bahasa Indonesia jadi transaksi
+     contoh: "bensin dua puluh empat ribu pakai tunai kemarin"
+     ============================================================ */
+  var SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition || null;
+  var NUM_WORDS = { nol: 0, kosong: 0, satu: 1, dua: 2, tiga: 3, empat: 4, lima: 5, enam: 6, tujuh: 7, delapan: 8, sembilan: 9 };
+  var NUM_SE = { sepuluh: 10, sebelas: 11, seratus: 100 };
+  var MULT = { ribu: 1e3, rb: 1e3, rebu: 1e3, k: 1e3, juta: 1e6, jt: 1e6, miliar: 1e9, milyar: 1e9, m: 1e9 };
+  var NUM_OPS = { puluh: 1, belas: 1, ratus: 1, setengah: 1, koma: 1, seribu: 1, sejuta: 1 };
+  var FILLER = ['rp', 'rupiah', 'sebesar', 'seharga', 'senilai', 'harganya', 'catat', 'tambah', 'tambahkan', 'pengeluaran', 'pemasukan', 'tadi', 'pada', 'tanggal'];
+  var MONTH_IDX = { januari: 1, februari: 2, maret: 3, april: 4, mei: 5, juni: 6, juli: 7, agustus: 8, september: 9, oktober: 10, november: 11, desember: 12 };
+
+  function isNumTok(t) {
+    return /^\d+([.,]\d+)*$/.test(t) || t in NUM_WORDS || t in NUM_SE || t in MULT || t in NUM_OPS;
+  }
+  function tokVal(t) {
+    if (/^\d{1,3}([.,]\d{3})+$/.test(t)) return +t.replace(/[.,]/g, '');
+    if (/^\d+([.,]\d+)?$/.test(t)) return parseFloat(t.replace(',', '.'));
+    return null;
+  }
+  /** Nilai satu rangkaian token angka ("dua puluh empat ribu", "1,5 juta", "24.000"). */
+  function wordsToNumber(toks) {
+    var result = 0, cur = 0, last = 0, hasMult = false, decimalNext = false;
+    toks.forEach(function (t) {
+      var v = tokVal(t);
+      if (decimalNext && (v !== null || t in NUM_WORDS)) {
+        var dv = v !== null ? v : NUM_WORDS[t];
+        cur += dv / Math.pow(10, String(dv).length); decimalNext = false; return;
+      }
+      if (v !== null) { cur += v; last = v; }
+      else if (t in NUM_WORDS) { cur += NUM_WORDS[t]; last = NUM_WORDS[t]; }
+      else if (t in NUM_SE) { cur += NUM_SE[t]; last = 0; }
+      else if (t === 'belas') { cur += 10; last = 0; }
+      else if (t === 'puluh') { cur += last * 9; last = 0; }
+      else if (t === 'ratus') { cur += last * 99; last = 0; }
+      else if (t === 'setengah') { cur += 0.5; last = 0; }
+      else if (t === 'koma') { decimalNext = true; }
+      else if (t === 'seribu') { result += 1000; hasMult = true; }
+      else if (t === 'sejuta') { result += 1e6; hasMult = true; }
+      else if (t in MULT) { result += (cur || 1) * MULT[t]; cur = 0; last = 0; hasMult = true; }
+    });
+    if (result >= 1e6 && result % 1e6 === 0 && cur >= 100 && cur < 1000) cur *= 1000; // "dua juta lima ratus" = 2.500.000
+    return { value: Math.round(result + cur), hasMult: hasMult };
+  }
+
+  function mapSource(word) {
+    var src = (S.server && S.server.sources) || [];
+    var find = function (re) { return (src.filter(function (s) { return re.test(norm(s.nama)); })[0] || {}).nama || ''; };
+    var direct = src.filter(function (s) { return norm(s.nama) === word; })[0];
+    if (direct) return direct.nama;
+    if (/^(tunai|cash|kontan|cas)$/.test(word)) return find(/tunai|cash|kontan/);
+    if (/^(e-?wallet|gopay|ovo|dana|shopeepay|shopee pay|qris|linkaja|emoney|e-money)$/.test(word)) return find(/wallet|gopay|ovo|dana|shopee|qris/) || find(new RegExp(word));
+    if (/^(bank|rekening|transfer|tf|debit|atm|bca|bri|bni|mandiri|bsi|btn|cimb|jago|seabank|blu)$/.test(word)) return find(new RegExp('^' + word + '$')) || find(/bank|rekening|bca|bri|bni|mandiri/);
+    return '';
+  }
+
+  /** Mengurai kalimat jadi {jenis, nominal, tanggal, sumber, keterangan}. Kosong jika tidak dikenali. */
+  function parseVoice(text) {
+    var out = {};
+    var s = ' ' + String(text || '').toLowerCase()
+      .replace(/(\d)\s*(rb|ribu|rebu|k|jt|juta)\b/g, '$1 $2')
+      .replace(/\brp\.?\s*/g, ' rp ')
+      .replace(/[!?;:"“”()]/g, ' ')
+      .replace(/(\D)[.,](\D|$)/g, '$1 $2')
+      .replace(/\s+/g, ' ') + ' ';
+
+    // jenis
+    if (/ (pemasukan|pendapatan|terima|diterima|dapat|dapet|masuk|gajian|transferan masuk) /.test(s)) out.jenis = 'masuk';
+    else if (/ (pengeluaran|keluar|beli|bayar|belanja|jajan) /.test(s)) out.jenis = 'keluar';
+    else if (/ (gaji|bonus|insentif|lembur) /.test(s)) out.jenis = 'masuk';
+
+    // tanggal
+    var t = today(), m;
+    if (/ kemarin lusa /.test(s)) { out.tanggal = addDays(t, -2); s = s.replace(/ kemarin lusa /, ' '); }
+    else if (/ kemarin /.test(s)) { out.tanggal = addDays(t, -1); s = s.replace(/ kemarin /, ' '); }
+    else if (/ hari ini /.test(s)) { out.tanggal = t; s = s.replace(/ hari ini /, ' '); }
+    if ((m = s.match(/ ((?:\S+ ){0,2}\S+) hari (?:yang )?lalu /))) {
+      var pre = m[1].split(' '), k = pre.length;
+      while (k > 0 && isNumTok(pre[k - 1]) && !(pre[k - 1] in MULT)) k--;
+      var numToks = pre.slice(k);
+      var nd = numToks.length ? wordsToNumber(numToks).value : 0;
+      if (nd > 0 && nd < 400) { out.tanggal = addDays(t, -nd); s = s.replace(m[0], ' ' + pre.slice(0, k).join(' ') + ' '); }
+    }
+    if ((m = s.match(/ tanggal (\d{1,2}|[a-z]+(?: (?:belas|puluh(?: [a-z]+)?))?)(?: (januari|februari|maret|april|mei|juni|juli|agustus|september|oktober|november|desember))?(?: (\d{4}))? /))) {
+      var day = /^\d+$/.test(m[1]) ? +m[1] : wordsToNumber(m[1].split(' ')).value;
+      if (day >= 1 && day <= 31) {
+        var y = m[3] ? +m[3] : +t.slice(0, 4), mo = m[2] ? MONTH_IDX[m[2]] : +t.slice(5, 7);
+        var cand = y + '-' + pad(mo) + '-' + pad(Math.min(day, monthLen(y, mo)));
+        if (!m[2] && cand > t) { mo -= 1; if (mo < 1) { mo = 12; y -= 1; } cand = y + '-' + pad(mo) + '-' + pad(Math.min(day, monthLen(y, mo))); }
+        out.tanggal = cand; s = s.replace(m[0], ' ');
+      }
+    }
+
+    // sumber dana: "pakai gopay", "via transfer", atau kata yang jelas seperti "tunai"
+    var srcRe = / (?:(?:pakai|pake|via|lewat|dengan|dari|bayar pakai|pakai uang) )(e-?wallet|gopay|ovo|dana|shopee ?pay|qris|linkaja|e-?money|tunai|cash|kontan|bank|rekening|transfer|tf|debit|atm|bca|bri|bni|mandiri|bsi|btn|cimb|jago|seabank|blu)(?: [a-z]+)? /;
+    var bareRe = / (tunai|cash|kontan|gopay|ovo|shopeepay|qris|transfer) /;
+    var srcM = s.match(srcRe) || s.match(bareRe);
+    if (srcM) {
+      var srcName = mapSource(srcM[1].replace(' ', ''));
+      if (srcName) { out.sumber = srcName; s = s.replace(srcM[0], ' '); }
+    }
+    ((S.server && S.server.sources) || []).forEach(function (src) {
+      var n = norm(src.nama);
+      if (!out.sumber && n.length > 2 && s.indexOf(' ' + n + ' ') >= 0) { out.sumber = src.nama; s = s.replace(' ' + n + ' ', ' '); }
+    });
+
+    // nominal: rangkaian token angka; utamakan yang punya "ribu/juta" atau "rp"
+    var toks = s.trim().split(' ');
+    var runs = [], cur = null;
+    toks.forEach(function (tk, i) {
+      if (isNumTok(tk) && !(tk === 'm' && !cur) && !(tk === 'k' && !cur)) {
+        if (!cur) { cur = { start: i, toks: [], rp: toks[i - 1] === 'rp' }; runs.push(cur); }
+        cur.toks.push(tk); cur.end = i;
+      } else cur = null;
+    });
+    runs.forEach(function (r) { var w = wordsToNumber(r.toks); r.value = w.value; r.hasMult = w.hasMult; });
+    var best = runs.filter(function (r) { return r.value > 0; }).sort(function (a, b) {
+      return (b.hasMult || b.rp) - (a.hasMult || a.rp) || b.value - a.value;
+    })[0];
+    if (best) {
+      var val = best.value;
+      if (!best.hasMult && val < 1000) val *= 1000; // "bensin dua puluh empat" = Rp 24.000
+      out.nominal = val;
+      toks.splice(best.start, best.end - best.start + 1, '\u0000');
+    }
+
+    // keterangan = sisa kata, tanpa kata pengisi
+    var words = toks.filter(function (w) { return w && w !== '\u0000' && FILLER.indexOf(w) < 0; });
+    while (words.length && /^(beli|bayar|untuk|buat|uang|dan|yang|di|ke|pakai|pake|via|lewat|dengan|dapat|dapet|terima|diterima|masuk|dari)$/.test(words[0])) words.shift();
+    while (words.length && /^(untuk|buat|pakai|pake|via|lewat|dengan|dan|yang|di|ke|dari)$/.test(words[words.length - 1])) words.pop();
+    var ket = words.join(' ').replace(/\s+/g, ' ').trim();
+    if (ket) out.keterangan = ket;
+    return out;
+  }
+  window.KU_parseVoice = parseVoice;
+
   function catIndex(nama, jenis) {
     var list = categories(jenis).filter(function (c) { return norm(c.nama) !== 'lainnya'; });
     for (var i = 0; i < list.length; i++) if (list[i].nama === nama) return i;
@@ -548,7 +684,7 @@
     var icon = catIcon(t.cat, t.jenis);
     var meta = esc(t.cat) + (t.sumber ? ' · ' + esc(t.sumber) : '');
     return '<li><button class="tx" data-tx="' + esc(t.id) + '">' +
-      '<span class="tx-icon" style="background:' + hexA(t.jenis === 'masuk' ? C_IN : catColor(t.cat, t.jenis), .14) + '">' + esc(icon) + '</span>' +
+      '<span class="tx-icon" style="--c:' + (t.jenis === 'masuk' ? C_IN : catColor(t.cat, t.jenis)) + '">' + esc(icon) + '</span>' +
       '<span class="tx-main"><p class="tx-title">' + esc(t.keterangan || t.cat) + '</p><p class="tx-meta">' + meta + '</p></span>' +
       '<span class="tx-amt money' + (t.jenis === 'masuk' ? ' in' : '') + '">' + (t.jenis === 'masuk' ? '+' : '−') + rp(t.nominal) +
       (t._pending ? '<i class="tx-pending" title="Belum terkirim"></i>' : '') + '</span></button></li>';
@@ -597,7 +733,7 @@
 
     html += '<section class="hero" aria-label="Ringkasan">' +
       '<p class="hero-label">Saldo bersih</p>' +
-      '<p class="hero-amount money"><span class="rp">' + (inn - out < 0 ? '−Rp' : 'Rp') + '</span>' + fmt(Math.abs(inn - out)) + '</p>' +
+      '<p class="hero-amount money"><span class="rp">' + (inn - out < 0 ? '−Rp' : 'Rp') + '</span><span id="hero-num">' + fmt(Math.abs(inn - out)) + '</span></p>' +
       '<p class="hero-period">' + esc(r.label) + '</p>' +
       '<div class="hero-split">' +
       '<div class="glass"><p class="glass-label"><i>↓</i>Pemasukan</p><p class="glass-value money">' + rp(inn) + '</p></div>' +
@@ -647,6 +783,21 @@
 
     root.innerHTML = html;
     bindHome(root);
+    countUp($('#hero-num', root), Math.abs(inn - out));
+  }
+  var heroShown = null;
+  function countUp(el, to) {
+    if (!el) return;
+    var from = heroShown === null ? to * 0.6 : heroShown;
+    heroShown = to;
+    var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (reduce || from === to) { el.textContent = fmt(to); return; }
+    var t0 = performance.now(), dur = 700;
+    (function step(now) {
+      var p = Math.min(1, (now - t0) / dur), e = 1 - Math.pow(1 - p, 3);
+      el.textContent = fmt(from + (to - from) * e);
+      if (p < 1 && el.isConnected) requestAnimationFrame(step);
+    })(t0);
   }
   function tile(label, value, sub) {
     return '<div class="card tile"><p class="tile-label">' + label + '</p><p class="tile-value">' + value + '</p><p class="tile-sub money">' + sub + '</p></div>';
@@ -936,6 +1087,9 @@
     r = Math.min(r, w / 2, h);
     return 'M' + x + ',' + (y + h) + 'V' + (y + r) + 'Q' + x + ',' + y + ' ' + (x + r) + ',' + y + 'H' + (x + w - r) + 'Q' + (x + w) + ',' + y + ' ' + (x + w) + ',' + (y + r) + 'V' + (y + h) + 'Z';
   }
+  function vgrad(id, color, top, bottom) {
+    return '<linearGradient id="' + id + '" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="' + color + '" stop-opacity="' + top + '"/><stop offset="1" stop-color="' + color + '" stop-opacity="' + bottom + '"/></linearGradient>';
+  }
   function axisFrame(W, H, L, B, T, max) {
     var g = '';
     [0, 0.5, 1].forEach(function (f) {
@@ -951,11 +1105,11 @@
     var band = (W - L) / data.length, bw = Math.max(2, Math.min(18, band - 2));
     var ph = H - T - B;
     var every = Math.ceil(data.length / 8), lastLab = -99;
-    var svg = '<div class="chart" data-chart><svg viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="Grafik batang pengeluaran">' + axisFrame(W, H, L, B, T, max);
+    var svg = '<div class="chart" data-chart><svg viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="Grafik batang pengeluaran"><defs>' + vgrad('gb-main', opt.color, .9, .35) + vgrad('gb-hi', opt.color, 1, .7) + '</defs>' + axisFrame(W, H, L, B, T, max);
     data.forEach(function (d, i) {
       var h = d.value / max * ph, x = L + i * band + (band - bw) / 2, y = T + ph - h;
-      var col = d.key === opt.highlight ? C_OUT : hexA(opt.color, d.future ? 0.2 : 0.78);
-      svg += '<path class="mark" data-i="' + i + '" d="' + barPath(x, y, bw, h, 4) + '" fill="' + col + '"/>';
+      var hi = d.key === opt.highlight;
+      svg += '<path class="mark' + (hi ? ' glowbar' : '') + '" data-i="' + i + '" d="' + barPath(x, y, bw, h, 4) + '" fill="url(#' + (hi ? 'gb-hi' : 'gb-main') + ')"' + (d.future ? ' opacity="0.3"' : '') + '/>';
       if ((i % every === 0 && data.length - 1 - i >= every / 2) || i === data.length - 1) lastLab = i, svg += '<text class="axis-text" x="' + (x + bw / 2) + '" y="' + (H - 6) + '" text-anchor="middle">' + esc(d.label) + '</text>';
       svg += '<rect class="hit" data-i="' + i + '" x="' + (L + i * band) + '" y="' + T + '" width="' + band + '" height="' + ph + '" tabindex="0" aria-label="' + esc(d.full + ': ' + rp(d.value)) + '"/>';
     });
@@ -970,12 +1124,12 @@
     var W = 340, H = 190, L = 40, B = 22, T = 10;
     var max = niceMax(Math.max.apply(null, data.map(function (d) { return Math.max(d.a, d.b); }).concat([1])));
     var band = (W - L) / data.length, bw = Math.min(16, (band - 14) / 2), ph = H - T - B;
-    var svg = '<div class="chart" data-chart><svg viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="Pemasukan dan pengeluaran per bulan">' + axisFrame(W, H, L, B, T, max);
+    var svg = '<div class="chart" data-chart><svg viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="Pemasukan dan pengeluaran per bulan"><defs>' + vgrad('gv-in', C_IN, 1, .45) + vgrad('gv-out', C_OUT, 1, .45) + '</defs>' + axisFrame(W, H, L, B, T, max);
     data.forEach(function (d, i) {
       var cx = L + i * band + band / 2;
       var ha = d.a / max * ph, hb = d.b / max * ph;
-      svg += '<path class="mark" data-i="' + i + '" d="' + barPath(cx - bw - 1, T + ph - ha, bw, ha, 4) + '" fill="' + C_IN + '"/>';
-      svg += '<path class="mark" data-i="' + i + '" d="' + barPath(cx + 1, T + ph - hb, bw, hb, 4) + '" fill="' + C_OUT + '"/>';
+      svg += '<path class="mark" data-i="' + i + '" d="' + barPath(cx - bw - 1, T + ph - ha, bw, ha, 4) + '" fill="url(#gv-in)"/>';
+      svg += '<path class="mark" data-i="' + i + '" d="' + barPath(cx + 1, T + ph - hb, bw, hb, 4) + '" fill="url(#gv-out)"/>';
       svg += '<text class="axis-text" x="' + cx + '" y="' + (H - 6) + '" text-anchor="middle">' + esc(d.label) + '</text>';
       svg += '<rect class="hit" data-i="' + i + '" x="' + (L + i * band) + '" y="' + T + '" width="' + band + '" height="' + ph + '" tabindex="0" aria-label="' + esc(d.full + ': masuk ' + rp(d.a) + ', keluar ' + rp(d.b)) + '"/>';
     });
@@ -1039,7 +1193,7 @@
   }
   function donutChart(cats, total) {
     var data = foldCats(cats);
-    var S0 = 150, cx = 75, cy = 75, R = 72, r0 = 50;
+    var S0 = 150, cx = 75, cy = 75, R = 74, r0 = 52;
     var a = -Math.PI / 2, svg = '';
     data.forEach(function (d, i) {
       var ang = d.value / total * Math.PI * 2;
@@ -1055,7 +1209,7 @@
     var legend = data.map(function (d, i) {
       return '<li><button data-i="' + i + '"><span class="sw" style="background:' + d.color + '"></span><span>' + esc(d.name) + '</span><span class="lv">' + Math.round(d.share * 100) + '%</span></button></li>';
     }).join('');
-    return '<div class="donut-wrap"><div class="chart" data-chart data-donut><svg viewBox="0 0 ' + S0 + ' ' + S0 + '" role="img" aria-label="Diagram donat pengeluaran per kategori">' + svg +
+    return '<div class="donut-wrap"><div class="chart" data-chart data-donut><svg class="donut-svg" viewBox="0 0 ' + S0 + ' ' + S0 + '" role="img" aria-label="Diagram donat pengeluaran per kategori">' + svg + '<circle cx="75" cy="75" r="46" fill="rgba(255,255,255,.88)" stroke="#fff"/>' +
       '<text class="donut-center-label" x="75" y="70" text-anchor="middle" id="dc-l">Total</text><text class="donut-center-value" x="75" y="89" text-anchor="middle" id="dc-v">' + rpShort(total) + '</text></svg></div>' +
       '<ul class="legend">' + legend + '</ul></div>';
   }
@@ -1063,7 +1217,7 @@
     var max = cats[0] ? cats[0].value : 1;
     return '<div class="cat-rows">' + cats.map(function (c) {
       var col = catColor(c.name, 'keluar');
-      return '<div class="cat-row" style="--c:' + col + '"><span class="tx-icon" style="background:' + hexA(col, .14) + '">' + esc(catIcon(c.name, 'keluar')) + '</span>' +
+      return '<div class="cat-row" style="--c:' + col + '"><span class="tx-icon" style="--c:' + col + '">' + esc(catIcon(c.name, 'keluar')) + '</span>' +
         '<div><div class="name">' + esc(c.name) + '</div><div class="bar"><i style="width:' + (c.value / max * 100).toFixed(1) + '%"></i></div></div>' +
         '<div class="val money">' + rp(c.value) + '<small>' + (c.share * 100).toFixed(c.share < 0.1 ? 1 : 0).replace('.', ',') + '%</small></div></div>';
     }).join('') + '</div>';
@@ -1115,7 +1269,7 @@
       html += '<section class="section"><div class="section-head"><h2 class="section-title">Anggaran bulanan</h2></div><div class="card card-pad">' +
         '<p class="muted" style="margin:0 0 6px">Kosongkan jika tidak ingin dibatasi. Tersimpan di sheet "Kategori".</p>' +
         cats.map(function (c) {
-          return '<div class="budget-edit"><span class="tx-icon" style="background:' + hexA(catColor(c.nama, 'keluar'), .14) + '">' + esc(c.ikon) + '</span>' +
+          return '<div class="budget-edit"><span class="tx-icon" style="--c:' + catColor(c.nama, 'keluar') + '">' + esc(c.ikon) + '</span>' +
             '<label for="b-' + esc(c.urut) + '">' + esc(c.nama) + '</label>' +
             '<input type="text" id="b-' + esc(c.urut) + '" class="money" inputmode="numeric" data-budget="' + esc('keluar|' + c.nama) + '" value="' + (c.anggaran ? fmt(c.anggaran) : '') + '" placeholder="Rp 0"></div>';
         }).join('') +
@@ -1184,7 +1338,9 @@
       .sort(function (a, b) { return b.n - a.n; }).slice(0, 8).map(function (x) { return x.t; });
   }
 
+  var VOICE_HINT = 'mis. \u201cbensin dua puluh empat ribu pakai tunai\u201d';
   function openForm(opts) {
+    var voiceStop = function () {};
     var editing = opts.tx || null;
     var p = opts.preset || {};
     var f = {
@@ -1202,6 +1358,8 @@
     var html = '<div class="sheet-head"><h2 class="sheet-title" id="sheet-title">' + (editing ? 'Ubah transaksi' : 'Tambah transaksi') + '</h2>' +
       '<button class="sheet-close" data-close aria-label="Tutup">' + closeIcon + '</button></div>' +
       '<div class="seg" role="tablist" aria-label="Jenis transaksi"><button type="button" data-jenis="keluar">Pengeluaran</button><button type="button" data-jenis="masuk">Pemasukan</button></div>' +
+      (SpeechRec ? '<button type="button" class="voice-btn" id="f-voice" aria-live="polite"><span class="voice-orb" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></span>' +
+        '<span class="voice-text"><b id="f-voice-title">Ucapkan transaksi</b><small id="f-voice-hint">' + VOICE_HINT + '</small></span></button>' : '') +
       '<div class="amount-box" id="f-amount-box"><div class="amount-label">Nominal</div><div class="amount-row"><span class="rp">Rp</span>' +
       '<input id="f-amount" class="amount-input" inputmode="numeric" autocomplete="off" placeholder="0" aria-label="Nominal dalam rupiah" enterkeyhint="done"></div></div>' +
       '<p class="amount-error" id="f-amount-err" role="alert" hidden></p>' +
@@ -1229,7 +1387,7 @@
         if (!f.catTouched) f.kategori = suggest;
         $('#f-cats', body).innerHTML = cats.map(function (c) {
           var on = c.nama === f.kategori;
-          return '<button type="button" class="cat-btn' + (on ? ' is-on' : '') + (on && !f.catTouched ? ' is-suggest' : '') + '" data-cat="' + esc(c.nama) + '" aria-pressed="' + on + '"><span class="em">' + esc(c.ikon || '•') + '</span>' + esc(c.nama) + '</button>';
+          return '<button type="button" class="cat-btn' + (on ? ' is-on' : '') + (on && !f.catTouched ? ' is-suggest' : '') + '" style="--c:' + catColor(c.nama, f.jenis) + '" data-cat="' + esc(c.nama) + '" aria-pressed="' + on + '"><span class="em">' + esc(c.ikon || '•') + '</span>' + esc(c.nama) + '</button>';
         }).join('');
         $('#f-cat-hint', body).textContent = suggest && !f.catTouched ? 'dipilih otomatis' : '';
         $$('[data-cat]', body).forEach(function (b) {
@@ -1290,8 +1448,81 @@
       ket.addEventListener('input', debounce(function () { if (!f.catTouched) paintCats(); }, 150));
       ket.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); ket.blur(); } });
 
+      // ---- input suara ----
+      var vbtn = $('#f-voice', body), rec = null, listening = false, gotFinal = false;
+      function voiceState(state, title, hint) {
+        if (!vbtn) return;
+        vbtn.classList.toggle('is-listening', state === 'listen');
+        vbtn.classList.toggle('is-done', state === 'done');
+        vbtn.classList.toggle('is-error', state === 'error');
+        $('#f-voice-title', body).textContent = title;
+        $('#f-voice-hint', body).textContent = hint;
+      }
+      function stopVoice() {
+        listening = false;
+        if (rec) { try { rec.abort(); } catch (e) {} rec = null; }
+      }
+      voiceStop = stopVoice;
+      function applyVoice(pv, raw) {
+        if (pv.jenis && pv.jenis !== f.jenis) { f.jenis = pv.jenis; f.kategori = ''; }
+        if (pv.nominal) { amt.value = fmt(pv.nominal); clearAmtErr(); }
+        if (pv.keterangan) ket.value = pv.keterangan;
+        if (pv.tanggal) f.tanggal = pv.tanggal;
+        if (pv.sumber) f.sumber = pv.sumber;
+        f.catTouched = false;
+        paintJenis(); paintDate(); paintSrc();
+        vibrate(pv.nominal ? 15 : [20, 40, 20]);
+        if (pv.nominal) voiceState('done', 'Terisi dari suara, periksa lalu simpan', '\u201c' + raw + '\u201d');
+        else voiceState('error', 'Nominal tidak terdengar', '\u201c' + raw + '\u201d. Ketuk untuk ulangi, atau ketik nominalnya.');
+      }
+      function startVoice() {
+        if (!SpeechRec || !vbtn) return;
+        stopVoice();
+        try {
+          rec = new SpeechRec();
+          rec.lang = 'id-ID'; rec.interimResults = true; rec.maxAlternatives = 3; rec.continuous = false;
+        } catch (e) { voiceState('error', 'Input suara tidak tersedia', 'Browser ini belum mendukung input suara.'); return; }
+        gotFinal = false;
+        rec.onresult = function (e) {
+          var txt = Array.prototype.map.call(e.results, function (r) { return r[0].transcript; }).join(' ').trim();
+          var last = e.results[e.results.length - 1];
+          if (!last.isFinal) { voiceState('listen', 'Mendengarkan\u2026', '\u201c' + txt + '\u201d'); return; }
+          gotFinal = true; listening = false;
+          var alts = Array.prototype.slice.call(last).map(function (a) { return a.transcript.trim(); });
+          var chosen = null, chosenText = alts[0] || txt;
+          alts.some(function (alt) { var pv = parseVoice(alt); if (pv.nominal) { chosen = pv; chosenText = alt; return true; } return false; });
+          applyVoice(chosen || parseVoice(chosenText), chosenText);
+        };
+        rec.onerror = function (e) {
+          listening = false;
+          if (e.error === 'aborted') return;
+          var msg = {
+            'not-allowed': 'Izin mikrofon ditolak. Buka pengaturan situs di Chrome dan izinkan Mikrofon.',
+            'service-not-allowed': 'Izin mikrofon ditolak. Buka pengaturan situs di Chrome dan izinkan Mikrofon.',
+            'network': 'Input suara butuh koneksi internet. Ketik manual dulu.',
+            'no-speech': 'Tidak ada suara terdengar. Ketuk lalu ucapkan lagi.',
+            'audio-capture': 'Mikrofon tidak ditemukan atau sedang dipakai aplikasi lain.'
+          }[e.error] || 'Suara belum bisa dikenali. Ketuk untuk mencoba lagi.';
+          voiceState('error', 'Belum berhasil', msg);
+        };
+        rec.onend = function () {
+          if (!gotFinal && vbtn.classList.contains('is-listening')) voiceState('', 'Ucapkan transaksi', VOICE_HINT);
+          listening = false; rec = null;
+        };
+        try {
+          rec.start(); listening = true; vibrate(10);
+          if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+          voiceState('listen', 'Mendengarkan\u2026', 'Ucapkan nominal dan keperluannya, mis. \u201cmakan siang 35 ribu\u201d');
+        } catch (e) { voiceState('error', 'Belum berhasil', 'Ketuk sekali lagi untuk mulai.'); }
+      }
+      if (vbtn) vbtn.addEventListener('click', function () {
+        if (listening) { try { rec && rec.stop(); } catch (e) {} return; }
+        startVoice();
+      });
+
       paintJenis(); paintDate(); paintSrc();
-      if (!editing && !p.nominal) setTimeout(function () { amt.focus(); }, 60);
+      if (opts.voice && vbtn) setTimeout(startVoice, 250);
+      else if (!editing && !p.nominal) setTimeout(function () { amt.focus(); }, 60);
 
       $('#f-save', body).addEventListener('click', function () {
         var nominal = +digits(amt.value);
@@ -1318,7 +1549,7 @@
           undo: editing ? null : { label: 'Urungkan', run: function () { removeTx(tx, true); } }
         });
       });
-    });
+    }, function () { voiceStop(); });
   }
 
   /* ============================================================
@@ -1439,7 +1670,19 @@
      ============================================================ */
   function init() {
     $$('.nav-btn').forEach(function (b) { b.addEventListener('click', function () { go(b.dataset.view); }); });
-    $('#fab').addEventListener('click', function () { openForm({}); });
+    var fab = $('#fab'), lpTimer = null, longPressed = false;
+    // tekan lama tombol + = langsung catat dengan suara (dibuka saat jari diangkat)
+    fab.addEventListener('pointerdown', function () {
+      longPressed = false;
+      lpTimer = setTimeout(function () { longPressed = true; vibrate(20); fab.classList.add('is-pressing'); }, 450);
+    });
+    fab.addEventListener('pointerup', function () {
+      clearTimeout(lpTimer); fab.classList.remove('is-pressing');
+      if (longPressed) openForm({ voice: true });
+    });
+    ['pointerleave', 'pointercancel'].forEach(function (ev) { fab.addEventListener(ev, function () { clearTimeout(lpTimer); fab.classList.remove('is-pressing'); if (ev === 'pointercancel') longPressed = false; }); });
+    fab.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+    fab.addEventListener('click', function () { if (longPressed) { longPressed = false; return; } openForm({}); });
     $('#scrim').addEventListener('click', closeSheet);
     $('#btn-refresh').addEventListener('click', function () { flush().then(function () { refresh(false); }); });
     $('#demo-exit').addEventListener('click', function () { showConnect(true); });
@@ -1462,8 +1705,8 @@
       refresh(true).then(function () { if (S.queue.length) flush(); });
       // pintasan dari ikon aplikasi (tekan lama ikon) atau ?aksi=tambah
       var q = new URLSearchParams(location.search).get('aksi');
-      if (q === 'tambah' || q === 'pemasukan') {
-        setTimeout(function () { openForm(q === 'pemasukan' ? { preset: { jenis: 'masuk' } } : {}); }, 120);
+      if (q === 'tambah' || q === 'pemasukan' || q === 'suara') {
+        setTimeout(function () { openForm(q === 'pemasukan' ? { preset: { jenis: 'masuk' } } : q === 'suara' ? { voice: true } : {}); }, 120);
         try { history.replaceState(null, '', location.pathname); } catch (e) {}
       }
     }
